@@ -2,11 +2,13 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { removeDirSync } from "@cloudflare/workers-utils";
 import { Request } from "miniflare";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import {
 	decodeEncodedSpecifier,
+	ENABLE_NMR_FALLBACK_REDIRECT_WORKAROUND,
 	ENCODED_PATH_PREFIX,
 	encodeRedirectLocation,
 	handleModuleFallbackRequest,
@@ -16,10 +18,11 @@ import type { Vite } from "vitest/node";
 // The fallback handler only reads `vite.pluginContainer.resolveId`, and only
 // when a specifier can't be resolved directly from the filesystem. Returning
 // `null` mimics Vite failing to resolve, exercising the 404 fall-through.
-function fakeVite(): Vite.ViteDevServer {
+function fakeVite(resolvedId?: string): Vite.ViteDevServer {
 	return {
 		pluginContainer: {
-			resolveId: async () => null,
+			resolveId: async () =>
+				resolvedId === undefined ? null : { id: resolvedId },
 		},
 	} as unknown as Vite.ViteDevServer;
 }
@@ -40,6 +43,19 @@ function moduleFallbackRequest(options: {
 	}
 	return new Request(url.href, {
 		headers: { "X-Resolve-Method": options.method },
+	});
+}
+
+function v2ModuleFallbackRequest(options: {
+	type: "import" | "require" | "internal";
+	specifier: string;
+	referrer: string;
+	rawSpecifier?: string;
+	attributes?: Array<{ name: string; value: string }>;
+}): Request {
+	return new Request("http://localhost/", {
+		method: "POST",
+		body: JSON.stringify(options),
 	});
 }
 
@@ -254,5 +270,161 @@ describe("handleModuleFallbackRequest non-ASCII paths", () => {
 		} finally {
 			errorSpy.mockRestore();
 		}
+	});
+});
+
+describe("handleModuleFallbackRequest new module registry", () => {
+	let tmp: string;
+
+	beforeEach(() => {
+		tmp = fs.realpathSync(
+			fs.mkdtempSync(path.join(os.tmpdir(), "mf-fallback-v2-"))
+		);
+	});
+
+	afterEach(() => {
+		removeDirSync(tmp);
+	});
+
+	it("preserves canonical URLs and native import.meta in ES modules", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.mjs");
+		const contents = "export default import.meta.url;";
+		fs.writeFileSync(filePath, contents);
+		const specifier = pathToFileURL(filePath).href;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier,
+				rawSpecifier: "./module.mjs",
+				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			esModule: contents,
+		});
+	});
+
+	it("returns native CommonJS modules with their named exports", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.cjs");
+		const contents = "exports.value = 42;";
+		fs.writeFileSync(filePath, contents);
+		const specifier = pathToFileURL(filePath).href;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier,
+				rawSpecifier: "./module.cjs",
+				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			commonJsModule: contents,
+			namedExports: ["value"],
+		});
+	});
+
+	it("preserves forced module types encoded in URL queries", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.txt");
+		const contents = "plain text";
+		fs.writeFileSync(filePath, contents);
+		const specifier = `${pathToFileURL(filePath).href}?mf_vitest_force=Text`;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier,
+				rawSpecifier: specifier,
+				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			text: contents,
+		});
+	});
+
+	it("selects the V2 module identity strategy using the workaround flag", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "package.mjs");
+		const contents = "export default 42;";
+		fs.writeFileSync(filePath, contents);
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(filePath),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier: "file:///bundle/package",
+				rawSpecifier: "package",
+				referrer: "file:///bundle/entry.mjs",
+			})
+		);
+
+		if (ENABLE_NMR_FALLBACK_REDIRECT_WORKAROUND) {
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({
+				name: "file:///bundle/package",
+				esModule: contents,
+			});
+		} else {
+			expect(response.status).toBe(301);
+			expect(response.headers.get("Location")).toBe(
+				pathToFileURL(filePath).href
+			);
+		}
+	});
+
+	it("canonicalises static and dynamic ES module dependencies", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.mjs");
+		const dependencyPath = path.join(tmp, "dependency.mjs");
+		const contents = [
+			'import value from "package";',
+			'export const lazy = import("./lazy.mjs");',
+			'import assert from "node:assert";',
+		].join("\n");
+		fs.writeFileSync(filePath, contents);
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(dependencyPath),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier: pathToFileURL(filePath).href,
+				rawSpecifier: "./module.mjs",
+				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: pathToFileURL(filePath).href,
+			esModule: ENABLE_NMR_FALLBACK_REDIRECT_WORKAROUND
+				? [
+						`import value from "${pathToFileURL(dependencyPath).href}";`,
+						`export const lazy = import(${JSON.stringify(pathToFileURL(dependencyPath).href)});`,
+						'import assert from "node:assert";',
+					].join("\n")
+				: contents,
+		});
 	});
 });

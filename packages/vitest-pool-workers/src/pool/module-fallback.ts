@@ -6,10 +6,15 @@ import posixPath from "node:path/posix";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import util from "node:util";
 import * as cjsModuleLexer from "cjs-module-lexer";
-import { Response } from "miniflare";
+import * as esModuleLexer from "es-module-lexer";
+import { parseModuleFallbackRequest, Response } from "miniflare";
 import { workerdBuiltinModules } from "../shared/builtin-modules";
 import { isFileNotFoundError } from "./helpers";
-import type { Request, Worker_Module } from "miniflare";
+import type {
+	ParsedModuleFallbackRequest,
+	Request,
+	Worker_Module,
+} from "miniflare";
 import type { Vite } from "vitest/node";
 
 let debuglog: util.DebugLoggerFunction = util.debuglog(
@@ -607,7 +612,7 @@ async function load(
 	return buildModuleResponse(rawTarget, { commonJsModule: contents });
 }
 
-export async function handleModuleFallbackRequest(
+async function handleV1ModuleFallbackRequest(
 	vite: Vite.ViteDevServer,
 	request: Request
 ): Promise<Response> {
@@ -701,4 +706,367 @@ export async function handleModuleFallbackRequest(
 	}
 
 	return new Response(null, { status: 404 });
+}
+
+type V2ResolveMethod = ResolveMethod | "internal";
+
+async function resolveV2(
+	vite: Vite.ViteDevServer,
+	method: V2ResolveMethod,
+	target: string,
+	specifier: string,
+	referrer: string
+): Promise<string> {
+	const isRequire = method === "require";
+	if (isRequire && target.endsWith(wasmModuleSuffix)) {
+		target = trimSuffix("?module", target);
+	}
+
+	const forcedTypeMatch = forceModuleTypeRegexp.exec(target);
+	if (
+		forcedTypeMatch !== null &&
+		isFile(trimSuffix(forcedTypeMatch[0], target))
+	) {
+		return target;
+	}
+
+	let filePath = maybeGetTargetFilePath(target, isRequire);
+	if (filePath !== undefined) {
+		return filePath;
+	}
+
+	const specifierLibPath = posixPath.join(
+		libPath,
+		specifier.replaceAll(":", "/")
+	);
+	filePath = maybeGetTargetFilePath(specifierLibPath, /* isRequire */ true);
+	if (filePath !== undefined) {
+		return filePath;
+	}
+
+	const resolved = await viteResolve(
+		vite,
+		specifier,
+		referrer,
+		method === "require"
+	);
+	if (/^\/?(node|cloudflare|workerd):/.test(resolved)) {
+		throw new Error("Not found");
+	}
+	return resolved;
+}
+
+function moduleUrlToResolutionTarget(specifier: string): string {
+	const url = new URL(specifier);
+	return url.protocol === "file:"
+		? ensurePosixLikePath(fileURLToPath(url)) + url.search
+		: specifier;
+}
+
+function pathToModuleUrl(filePath: string): string {
+	const queryIndex = filePath.indexOf("?");
+	if (queryIndex === -1) {
+		return pathToFileURL(filePath).href;
+	}
+	return (
+		pathToFileURL(filePath.slice(0, queryIndex)).href +
+		filePath.slice(queryIndex)
+	);
+}
+
+function buildV2ModuleResponse(
+	name: string,
+	contents: ModuleContents,
+	namedExports?: Iterable<string>
+): Response {
+	const result: Record<string, unknown> = { name };
+	for (const key in contents) {
+		const value = (contents as Record<string, unknown>)[key];
+		result[key] = value instanceof Uint8Array ? Array.from(value) : value;
+	}
+	if (namedExports !== undefined) {
+		result.namedExports = Array.from(namedExports);
+	}
+	return Response.json(result);
+}
+
+type LoadedV2Module = {
+	contents: ModuleContents;
+	namedExports?: Iterable<string>;
+};
+
+async function loadV2Module(
+	vite: Vite.ViteDevServer,
+	logBase: string,
+	method: V2ResolveMethod,
+	specifier: string,
+	filePath: string
+): Promise<LoadedV2Module> {
+	if (
+		method === "require" &&
+		specifier.endsWith(wasmModuleSuffix) &&
+		filePath.endsWith(".wasm")
+	) {
+		const wrapper = `module.exports = { default: require(${JSON.stringify(pathToModuleUrl(filePath))}) };`;
+		debuglog(logBase, "wasm-module-wrapper:", filePath);
+		return { contents: { commonJsModule: wrapper } };
+	}
+
+	if (filePath.endsWith(".wasm")) {
+		filePath += `?mf_vitest_force=CompiledWasm`;
+	}
+
+	const maybeContents = maybeGetForceTypeModuleContents(filePath);
+	if (maybeContents !== undefined) {
+		debuglog(logBase, "forced:", filePath);
+		return { contents: maybeContents };
+	}
+
+	const isEsm =
+		filePath.endsWith(".mjs") ||
+		(filePath.endsWith(".js") && isWithinTypeModuleContext(filePath));
+
+	if (filePath.endsWith(".json")) {
+		const json = fs.readFileSync(filePath, "utf8");
+		debuglog(logBase, "json:", filePath);
+		return { contents: { json } };
+	}
+
+	const contents = fs.readFileSync(filePath, "utf8");
+	if (isEsm) {
+		debuglog(logBase, "esm:", filePath);
+		return { contents: { esModule: contents } };
+	}
+
+	debuglog(logBase, "cjs:", filePath);
+	const namedExports = await getCjsNamedExports(vite, filePath, contents);
+	return { contents: { commonJsModule: contents }, namedExports };
+}
+
+type V2ModuleFallbackRequest = Extract<
+	ParsedModuleFallbackRequest,
+	{ protocol: "v2" }
+>;
+
+function getV2RequestSpecifier(
+	request: V2ModuleFallbackRequest,
+	target: string,
+	referrer: string
+): string {
+	let specifier = request.rawSpecifier;
+	if (specifier?.startsWith("file:")) {
+		specifier = moduleUrlToResolutionTarget(specifier);
+		if (specifier.startsWith("/bundle/")) {
+			specifier = specifier.slice("/bundle/".length);
+		}
+	}
+	return (
+		specifier ?? getApproximateSpecifier(target, posixPath.dirname(referrer))
+	);
+}
+
+function handleV2ModuleFallbackError(
+	request: V2ModuleFallbackRequest,
+	target: string,
+	referrer: string,
+	logBase: string,
+	error: unknown
+): Response {
+	debuglog(logBase, "error:", error);
+	console.error(
+		`[vitest-pool-workers] Failed to ${request.type} ${JSON.stringify(target)} from ${JSON.stringify(referrer)}.`,
+		"To resolve this, try bundling the relevant dependency with Vite.",
+		"For more details, refer to https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#module-resolution"
+	);
+	return new Response(null, { status: 404 });
+}
+
+async function handleV2ModuleFallbackRequestWithCanonicalRedirects(
+	vite: Vite.ViteDevServer,
+	request: V2ModuleFallbackRequest
+): Promise<Response> {
+	assert(request.referrer !== undefined);
+	const target = moduleUrlToResolutionTarget(request.specifier);
+	const referrer = moduleUrlToResolutionTarget(request.referrer);
+	const specifier = getV2RequestSpecifier(request, target, referrer);
+	const logBase = `${request.type}(${JSON.stringify(target)}) relative to ${referrer}:`;
+
+	try {
+		const filePath = await resolveV2(
+			vite,
+			request.type,
+			target,
+			specifier,
+			referrer
+		);
+		const canonicalSpecifier = pathToModuleUrl(filePath);
+		if (canonicalSpecifier !== request.specifier) {
+			debuglog(logBase, "redirect:", canonicalSpecifier);
+			return new Response(null, {
+				status: 301,
+				headers: { Location: canonicalSpecifier },
+			});
+		}
+		const module = await loadV2Module(
+			vite,
+			logBase,
+			request.type,
+			specifier,
+			filePath
+		);
+		return buildV2ModuleResponse(
+			request.specifier,
+			module.contents,
+			module.namedExports
+		);
+	} catch (error) {
+		return handleV2ModuleFallbackError(
+			request,
+			target,
+			referrer,
+			logBase,
+			error
+		);
+	}
+}
+
+// Workerd does not consistently use the canonical URL for redirected fallback
+// modules: static imports use the original alias, while dynamic imports use a
+// canonical referrer missing from the isolate registry. Set this to false to
+// exercise the canonical redirect path once Workerd is fixed. Everything below
+// this flag, up to `handleV2ModuleFallbackRequest()`, can be removed with the
+// workaround.
+export const ENABLE_NMR_FALLBACK_REDIRECT_WORKAROUND = true;
+
+const v2ResolvedPaths = new WeakMap<Vite.ViteDevServer, Map<string, string>>();
+
+function getV2ResolvedPaths(vite: Vite.ViteDevServer): Map<string, string> {
+	let resolvedPaths = v2ResolvedPaths.get(vite);
+	if (resolvedPaths === undefined) {
+		resolvedPaths = new Map();
+		v2ResolvedPaths.set(vite, resolvedPaths);
+	}
+	return resolvedPaths;
+}
+
+async function rewriteV2ModuleSpecifiers(
+	vite: Vite.ViteDevServer,
+	contents: string,
+	filePath: string
+): Promise<string> {
+	await esModuleLexer.init;
+	const [imports] = esModuleLexer.parse(contents);
+	for (let i = imports.length - 1; i >= 0; i--) {
+		const imported = imports[i];
+		const specifier = imported.n;
+		if (specifier === undefined || /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(specifier)) {
+			continue;
+		}
+
+		let resolved: string;
+		try {
+			resolved = await viteResolve(
+				vite,
+				specifier,
+				filePath,
+				/* isRequire */ false
+			);
+		} catch {
+			continue;
+		}
+		if (/^\/?(node|cloudflare|workerd):/.test(resolved)) {
+			continue;
+		}
+
+		const canonicalSpecifier = pathToModuleUrl(resolved);
+		const replacement =
+			imported.d === -1
+				? canonicalSpecifier
+				: JSON.stringify(canonicalSpecifier);
+		contents =
+			contents.slice(0, imported.s) + replacement + contents.slice(imported.e);
+	}
+	return contents;
+}
+
+async function handleV2ModuleFallbackRequestWithRedirectWorkaround(
+	vite: Vite.ViteDevServer,
+	request: V2ModuleFallbackRequest
+): Promise<Response> {
+	assert(request.referrer !== undefined);
+	const resolvedPaths = getV2ResolvedPaths(vite);
+	const target =
+		resolvedPaths.get(request.specifier) ??
+		moduleUrlToResolutionTarget(request.specifier);
+	const referrer =
+		resolvedPaths.get(request.referrer) ??
+		moduleUrlToResolutionTarget(request.referrer);
+	const specifier = getV2RequestSpecifier(request, target, referrer);
+	const logBase = `${request.type}(${JSON.stringify(target)}) relative to ${referrer}:`;
+
+	try {
+		const filePath = await resolveV2(
+			vite,
+			request.type,
+			target,
+			specifier,
+			referrer
+		);
+		resolvedPaths.set(request.specifier, filePath);
+		const module = await loadV2Module(
+			vite,
+			logBase,
+			request.type,
+			specifier,
+			filePath
+		);
+		if ("esModule" in module.contents) {
+			module.contents.esModule = await rewriteV2ModuleSpecifiers(
+				vite,
+				module.contents.esModule,
+				filePath
+			);
+		}
+		return buildV2ModuleResponse(
+			request.specifier,
+			module.contents,
+			module.namedExports
+		);
+	} catch (error) {
+		return handleV2ModuleFallbackError(
+			request,
+			target,
+			referrer,
+			logBase,
+			error
+		);
+	}
+}
+
+async function handleV2ModuleFallbackRequest(
+	vite: Vite.ViteDevServer,
+	request: V2ModuleFallbackRequest
+): Promise<Response> {
+	if (request.referrer === undefined) {
+		return new Response("Invalid module fallback request", { status: 400 });
+	}
+
+	if (ENABLE_NMR_FALLBACK_REDIRECT_WORKAROUND) {
+		return handleV2ModuleFallbackRequestWithRedirectWorkaround(vite, request);
+	}
+
+	return handleV2ModuleFallbackRequestWithCanonicalRedirects(vite, request);
+}
+
+export async function handleModuleFallbackRequest(
+	vite: Vite.ViteDevServer,
+	request: Request
+): Promise<Response> {
+	const parsed = await parseModuleFallbackRequest(request);
+	if (parsed === null) {
+		return new Response("Invalid module fallback request", { status: 400 });
+	}
+	return parsed.protocol === "v1"
+		? handleV1ModuleFallbackRequest(vite, request)
+		: handleV2ModuleFallbackRequest(vite, parsed);
 }
