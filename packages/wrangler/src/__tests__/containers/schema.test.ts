@@ -7,6 +7,26 @@ type WranglerSchema = {
 		ContainerApp: {
 			properties: Record<string, unknown>;
 		};
+		ContainerInstanceGroupConfig: {
+			properties: Record<string, unknown> & {
+				type: {
+					const: string;
+				};
+			};
+			required: string[];
+		};
+		DurableObjectBindings: {
+			items: {
+				$ref: string;
+			};
+		};
+		DurableObjectBinding: {
+			properties: {
+				container: {
+					$ref: string;
+				};
+			};
+		};
 		RawConfig: {
 			properties: {
 				build: {
@@ -31,6 +51,24 @@ describe("config schema", () => {
 		expect(schema.definitions.ContainerApp.properties).not.toHaveProperty(
 			"wrangler_ssh"
 		);
+	});
+
+	it("documents Container Instance Groups on Durable Object bindings", ({
+		expect,
+	}) => {
+		const schema = readSchema();
+		const instanceGroup = schema.definitions.ContainerInstanceGroupConfig;
+
+		expect(instanceGroup.properties.type.const).toBe("instance");
+		expect(instanceGroup.required).toContain("type");
+		expect(instanceGroup.required).toContain("name");
+		expect(Object.keys(instanceGroup.properties)).toEqual(["type", "name"]);
+		expect(schema.definitions.DurableObjectBindings.items.$ref).toBe(
+			"#/definitions/DurableObjectBinding"
+		);
+		expect(
+			schema.definitions.DurableObjectBinding.properties.container.$ref
+		).toBe("#/definitions/ContainerInstanceGroupConfig");
 	});
 
 	it("emits markdownDescription for rich editor hovers", ({ expect }) => {

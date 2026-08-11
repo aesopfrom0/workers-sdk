@@ -3772,6 +3772,174 @@ describe("normalizeAndValidateConfig()", () => {
 				}
 			});
 
+			it("should accept a namespace-backed container instance group", ({
+				expect,
+			}) => {
+				const { diagnostics, config } = normalizeAndValidateConfig(
+					{
+						name: "test-worker-name",
+						durable_objects: {
+							bindings: [
+								{
+									name: "SANDBOX",
+									class_name: "Sandbox",
+									container: {
+										type: "instance",
+										name: "sandboxes",
+									},
+								},
+							],
+						},
+						migrations: [
+							{
+								tag: "v1",
+								new_sqlite_classes: ["Sandbox"],
+							},
+						],
+					} as unknown as RawConfig,
+					undefined,
+					undefined,
+					{ env: undefined }
+				);
+
+				expect(diagnostics.hasWarnings()).toBe(false);
+				expect(diagnostics.hasErrors()).toBe(false);
+				expect(config.durable_objects.bindings).toEqual([
+					{
+						name: "SANDBOX",
+						class_name: "Sandbox",
+						container: {
+							type: "instance",
+							name: "sandboxes",
+						},
+					},
+				]);
+			});
+
+			it("should reject unsupported Container Instance Group types", ({
+				expect,
+			}) => {
+				const { diagnostics } = normalizeAndValidateConfig(
+					{
+						durable_objects: {
+							bindings: [
+								{
+									name: "SANDBOX",
+									class_name: "Sandbox",
+									container: {
+										type: "app",
+										name: "sandboxes",
+									},
+								},
+							],
+						},
+					} as unknown as RawConfig,
+					undefined,
+					undefined,
+					{ env: undefined }
+				);
+
+				expect(diagnostics.renderErrors()).toContain(
+					'durable_objects.bindings[0].container.type must be "instance", but got "app".'
+				);
+			});
+
+			it("should reject unsupported fields on Container Instance Groups", ({
+				expect,
+			}) => {
+				const { diagnostics } = normalizeAndValidateConfig(
+					{
+						durable_objects: {
+							bindings: [
+								{
+									name: "SANDBOX",
+									class_name: "Sandbox",
+									container: {
+										type: "instance",
+										name: "sandboxes",
+										ssh: {
+											enabled: true,
+										},
+									},
+								},
+							],
+						},
+					} as unknown as RawConfig,
+					undefined,
+					undefined,
+					{ env: undefined }
+				);
+
+				const errors = diagnostics.renderErrors();
+				expect(errors).toContain(
+					'Unexpected fields found in durable_objects.bindings[0].container field: "ssh"'
+				);
+			});
+
+			it("should reject classes configured as both applications and Instance Groups", ({
+				expect,
+			}) => {
+				const { diagnostics } = normalizeAndValidateConfig(
+					{
+						name: "test-worker",
+						durable_objects: {
+							bindings: [
+								{
+									name: "SANDBOX",
+									class_name: "Sandbox",
+									container: {
+										type: "instance",
+										name: "sandboxes",
+									},
+								},
+							],
+						},
+						containers: [
+							{
+								class_name: "Sandbox",
+								image: "registry.cloudflare.com/test:latest",
+							},
+						],
+					} as unknown as RawConfig,
+					undefined,
+					undefined,
+					{ env: undefined }
+				);
+
+				expect(diagnostics.renderErrors()).toContain(
+					'Durable Object class "Sandbox" cannot be configured in both "containers" and "durable_objects.bindings[].container".'
+				);
+			});
+
+			it("should reject Container Instance Groups on external bindings", ({
+				expect,
+			}) => {
+				const { diagnostics } = normalizeAndValidateConfig(
+					{
+						durable_objects: {
+							bindings: [
+								{
+									name: "SANDBOX",
+									class_name: "Sandbox",
+									script_name: "other-worker",
+									container: {
+										type: "instance",
+										name: "sandboxes",
+									},
+								},
+							],
+						},
+					} as unknown as RawConfig,
+					undefined,
+					undefined,
+					{ env: undefined }
+				);
+
+				expect(diagnostics.renderErrors()).toContain(
+					'binding cannot configure "container" when "script_name" is present. Container Instance Groups must be owned by the current Worker.'
+				);
+			});
+
 			it("should provide a name in a named environment that inherits the top level worker name", ({
 				expect,
 			}) => {

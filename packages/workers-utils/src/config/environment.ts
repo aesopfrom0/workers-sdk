@@ -338,6 +338,21 @@ export type ContainerApp = {
 };
 
 /**
+ * Namespace-backed Container Instance Group configuration.
+ */
+export type ContainerInstanceGroupConfig = {
+	/**
+	 * Selects the namespace-backed Container Instance Group model.
+	 */
+	type: "instance";
+
+	/**
+	 * Name of the Container Instance Group.
+	 */
+	name: string;
+};
+
+/**
  * Configuration in wrangler for Durable Object Migrations
  */
 export type DurableObjectMigration = {
@@ -798,7 +813,7 @@ interface EnvironmentInheritable {
 	previews: PreviewsConfig | undefined;
 }
 
-export type DurableObjectBindings = {
+export type DurableObjectBinding = {
 	/** The name of the binding used to refer to the Durable Object */
 	name: string;
 	/** The exported class name of the Durable Object */
@@ -807,7 +822,13 @@ export type DurableObjectBindings = {
 	script_name?: string;
 	/** The service environment of the script_name to bind to */
 	environment?: string;
-}[];
+	/**
+	 * Configure this namespace as a namespace-backed Container Instance Group.
+	 */
+	container?: ContainerInstanceGroupConfig;
+};
+
+export type DurableObjectBindings = DurableObjectBinding[];
 
 export const ARTIFACTS_EVENT_TYPES = [
 	"cf.artifacts.repo.created",

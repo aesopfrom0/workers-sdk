@@ -24,6 +24,7 @@ import {
 import { getBindings } from "./helpers/binding-utils";
 import { printBundleSize } from "./helpers/bundle-reporter";
 import { confirmLatestDeploymentOverwrite } from "./helpers/confirm-latest-deployment-overwrite";
+import { getContainerMetadata } from "./helpers/container-metadata";
 import { createWorkerUploadForm } from "./helpers/create-worker-upload-form";
 import { deployWfpUserWorker } from "./helpers/deploy-wfp";
 import {
@@ -125,6 +126,12 @@ export type DeployCallbacks = {
 		| ((
 				config: Config,
 				normalisedContainerConfig: ContainerNormalizedConfig[],
+				args: { versionId: string; accountId: string; scriptName: string }
+		  ) => Promise<void>)
+		| undefined;
+	deployContainerInstanceGroups:
+		| ((
+				config: Config,
 				args: { versionId: string; accountId: string; scriptName: string }
 		  ) => Promise<void>)
 		| undefined;
@@ -295,7 +302,7 @@ export default async function deploy(
 		migrations,
 		exports,
 		modules,
-		containers: config.containers,
+		containers: getContainerMetadata(config),
 		sourceMaps,
 		compatibility_date: compatibilityDate,
 		compatibility_flags: compatibilityFlags,
@@ -733,6 +740,19 @@ export default async function deploy(
 	) {
 		assert(versionId && accountId);
 		await callbacks.deployContainers(config, normalisedContainerConfig, {
+			versionId,
+			accountId,
+			scriptName,
+		});
+	}
+	if (
+		config.durable_objects.bindings.some(
+			(binding) => binding.container?.type === "instance"
+		) &&
+		callbacks.deployContainerInstanceGroups
+	) {
+		assert(versionId && accountId);
+		await callbacks.deployContainerInstanceGroups(config, {
 			versionId,
 			accountId,
 			scriptName,

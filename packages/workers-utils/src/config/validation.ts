@@ -2188,6 +2188,12 @@ function normalizeAndValidateEnvironment(
 		),
 	};
 
+	validateContainerInstanceGroupOwnership(
+		diagnostics,
+		environment.durable_objects,
+		environment.containers
+	);
+
 	warnIfDurableObjectsHaveNoLifecycleConfig(
 		diagnostics,
 		environment.durable_objects,
@@ -2791,6 +2797,46 @@ const validateUnsafeSettings =
 /**
  * Check that the given field is a valid "durable_object" binding object.
  */
+function validateContainerInstanceGroupConfig(
+	diagnostics: Diagnostics,
+	field: string,
+	value: unknown
+): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		diagnostics.errors.push(
+			`the field "container", when present, should be an object.`
+		);
+		return false;
+	}
+
+	const config = value as Record<string, unknown>;
+	let isValid = true;
+	if (config.type !== "instance") {
+		diagnostics.errors.push(
+			`${field}.type must be "instance", but got ${JSON.stringify(config.type)}.`
+		);
+		isValid = false;
+	}
+	if (!isRequiredProperty(config, "name", "string")) {
+		diagnostics.errors.push(`${field} should have a string "name" field.`);
+		isValid = false;
+	}
+
+	const unsupportedFields = Object.keys(config).filter(
+		(property) => property !== "name" && property !== "type"
+	);
+	if (unsupportedFields.length > 0) {
+		diagnostics.errors.push(
+			`Unexpected fields found in ${field} field: ${unsupportedFields
+				.map((property) => `"${property}"`)
+				.join(", ")}`
+		);
+		isValid = false;
+	}
+
+	return isValid;
+}
+
 const validateDurableObjectBinding: ValidatorFn = (
 	diagnostics,
 	field,
@@ -2834,6 +2880,21 @@ const validateDurableObjectBinding: ValidatorFn = (
 		isValid = false;
 	}
 
+	if ("container" in value && value.container !== undefined) {
+		if ("script_name" in value && value.script_name !== undefined) {
+			diagnostics.errors.push(
+				`binding cannot configure "container" when "script_name" is present. Container Instance Groups must be owned by the current Worker.`
+			);
+			isValid = false;
+		}
+		isValid =
+			validateContainerInstanceGroupConfig(
+				diagnostics,
+				`${field}.container`,
+				value.container
+			) && isValid;
+	}
+
 	if (!isRemoteValid(value, field, diagnostics)) {
 		isValid = false;
 	}
@@ -2843,6 +2904,7 @@ const validateDurableObjectBinding: ValidatorFn = (
 		"environment",
 		"name",
 		"script_name",
+		"container",
 	]);
 
 	return isValid;
@@ -3435,12 +3497,16 @@ function validateContainerApp(
 			return false;
 		}
 
-		for (const containerAppOptional of value) {
-			// validate that either a name is set and is a string
-			if (!isOptionalProperty(value, "name", "string")) {
+		for (const [containerIndex, containerAppOptional] of value.entries()) {
+			if (
+				typeof containerAppOptional !== "object" ||
+				containerAppOptional === null ||
+				Array.isArray(containerAppOptional)
+			) {
 				diagnostics.errors.push(
-					`Field "name", when present, should be a string, but got ${JSON.stringify(value)}`
+					`${field}[${containerIndex}] must be an object, but got ${JSON.stringify(containerAppOptional)}`
 				);
+				continue;
 			}
 
 			validateRequiredProperty(
@@ -3457,26 +3523,29 @@ function validateContainerApp(
 				containerAppOptional.name,
 				"string"
 			);
+
 			// try and add a default name
 			if (!containerAppOptional.name) {
 				// we need topLevelName and a containers.class_name if containers.name is not defined
 				if (
 					!topLevelName ||
-					!isOptionalProperty(containerAppOptional, "class_name", "string")
+					typeof containerAppOptional.class_name !== "string"
 				) {
 					diagnostics.errors.push(
 						`Must have either a top level "name" and "containers.class_name" field defined, or have field "containers.name" defined.`
 					);
+				} else {
+					// if there is worker name defined but no name for this container app default to:
+					// worker_name-class_name[-envName].
+					let name = `${topLevelName}-${containerAppOptional.class_name}`;
+					// config is undefined when we are at the top level instead of in a named env
+					// If we are in a named env, append it to the generated name
+					// so that users can re-use container definitions between different envs without issue.
+					name += config === undefined ? "" : `-${envName}`;
+					containerAppOptional.name = name.toLowerCase().replace(/ /g, "-");
 				}
-				// if there is worker name defined but no name for this container app default to:
-				// worker_name-class_name[-envName].
-				let name = `${topLevelName}-${containerAppOptional.class_name}`;
-				// config is undefined when we are at the top level instead of in a named env
-				// If we are in a named env, append it to the generated name
-				// so that users can re-use container definitions between different envs without issue.
-				name += config === undefined ? "" : `-${envName}`;
-				containerAppOptional.name = name.toLowerCase().replace(/ /g, "-");
 			}
+
 			if (
 				!containerAppOptional.configuration?.image &&
 				!containerAppOptional.image
@@ -6667,6 +6736,52 @@ const validateCache: ValidatorFn = (diagnostics, field, value) => {
 
 	return isValid;
 };
+
+function validateContainerInstanceGroupOwnership(
+	diagnostics: Diagnostics,
+	durableObjects: Config["durable_objects"],
+	containerApps: Config["containers"]
+): void {
+	if (!Array.isArray(durableObjects?.bindings)) {
+		return;
+	}
+
+	const instanceGroupClasses = new Set<string>();
+	const applicationClasses = new Set(
+		Array.isArray(containerApps)
+			? containerApps
+					.filter(
+						(container) =>
+							typeof container === "object" &&
+							container !== null &&
+							typeof container.class_name === "string"
+					)
+					.map((container) => container.class_name)
+			: []
+	);
+
+	for (const binding of durableObjects.bindings) {
+		if (typeof binding !== "object" || binding === null) {
+			continue;
+		}
+		if (binding.container === undefined) {
+			continue;
+		}
+
+		if (instanceGroupClasses.has(binding.class_name)) {
+			diagnostics.errors.push(
+				`Durable Object class "${binding.class_name}" has more than one Container Instance Group configuration.`
+			);
+		}
+		instanceGroupClasses.add(binding.class_name);
+
+		if (applicationClasses.has(binding.class_name)) {
+			diagnostics.errors.push(
+				`Durable Object class "${binding.class_name}" cannot be configured in both "containers" and "durable_objects.bindings[].container".`
+			);
+		}
+	}
+}
 
 /**
  * Emit a warning if a local Durable Object binding is not covered by either a
