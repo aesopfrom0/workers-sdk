@@ -9,10 +9,12 @@ import { syncAssets } from "../deploy/helpers/assets";
 import { getBindings } from "../deploy/helpers/binding-utils";
 import { moduleTypeMimeType } from "../deploy/helpers/create-worker-upload-form";
 import { parseConfigPlacement } from "../deploy/helpers/placement";
+import { isWorkerNotFoundError } from "../deploy/helpers/worker-not-found-error";
 import { confirm, logger } from "../shared/context";
 import {
 	createPreview,
 	createPreviewDeployment,
+	createPreviewParentWorker,
 	deletePreview,
 	editPreview,
 	getPreview,
@@ -349,6 +351,27 @@ ${Object.entries(missingBindings)
 Either include these bindings in the ${chalk.cyan(`"previews"`)} field of your Wrangler config or update the Previews settings of your Worker in the Cloudflare dashboard.`);
 }
 
+async function provisionParentWorker(
+	config: Config,
+	accountId: string,
+	workerName: string
+): Promise<void> {
+	const confirmed = await confirm(
+		`There doesn't seem to be a Worker called "${workerName}". Do you want to create it so the Preview can be attached to it?`,
+		// Default to true so CI and Workers Builds can create Previews unattended.
+		{ defaultValue: true, fallbackValue: true }
+	);
+	if (!confirmed) {
+		throw new UserError(
+			`Cannot create a Preview because the Worker "${workerName}" does not exist.`,
+			{ telemetryMessage: "preview command parent worker not created" }
+		);
+	}
+
+	logger.log(`🌀 Creating new Worker "${workerName}"...`);
+	await createPreviewParentWorker(config, accountId, workerName);
+}
+
 /**
  * Full preview create/update + deployment orchestration.
  * The wrangler handler calls this after auth + build.
@@ -392,7 +415,9 @@ export async function preview(
 			previewIdentifier
 		);
 	} catch (e) {
-		if (!(e instanceof Error && "code" in e && e.code === 10025)) {
+		if (isWorkerNotFoundError(e)) {
+			await provisionParentWorker(config, accountId, workerName);
+		} else if (!(e instanceof Error && "code" in e && e.code === 10025)) {
 			throw e;
 		}
 	}

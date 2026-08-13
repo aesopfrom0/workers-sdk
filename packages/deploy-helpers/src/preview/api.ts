@@ -163,6 +163,22 @@ type WorkerPreviewBaseConfigResource = {
 	previews_base_config?: PreviewBaseConfig;
 };
 
+/** Create an undeployed Worker that can own Preview resources and URLs. */
+export async function createPreviewParentWorker(
+	config: Config,
+	accountId: string,
+	workerName: string
+): Promise<void> {
+	await fetchResult(config, `/accounts/${accountId}/workers/workers`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			name: workerName,
+			subdomain: { previews_enabled: true },
+		}),
+	});
+}
+
 export async function getPreview(
 	config: Config,
 	accountId: string,
