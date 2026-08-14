@@ -1,5 +1,11 @@
 # create-cloudflare
 
+## 2.72.1
+
+### Patch Changes
+
+- [#14953](https://github.com/cloudflare/workers-sdk/pull/14953) [`05959fb`](https://github.com/cloudflare/workers-sdk/commit/05959fb980f24ef8bea9d40fbef49ebc2631bf2a) Thanks [@edmundhung](https://github.com/edmundhung)! - Update the Hello World templates to use the latest version of `@cloudflare/vitest-pool-workers`.
+
 ## 2.72.0
 
 ### Minor Changes

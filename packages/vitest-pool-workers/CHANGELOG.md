@@ -1,5 +1,25 @@
 # @cloudflare/vitest-pool-workers
 
+## 0.22.0
+
+### Minor Changes
+
+- [#13830](https://github.com/cloudflare/workers-sdk/pull/13830) [`49d4e00`](https://github.com/cloudflare/workers-sdk/commit/49d4e0096802fb4d5ff2fe7277c893065dfa8c86) Thanks [@penalosa](https://github.com/penalosa)! - Mocking requests with MSW in Worker tests now requires MSW >= 2.14
+
+  `@cloudflare/vitest-pool-workers` previously shipped internal shims to make MSW work inside the workerd runtime. MSW 2.14 added that support natively, so those shims have been removed.
+
+  If you mock requests with MSW in your Worker tests, make sure you're on MSW `>= 2.14`; older versions will no longer intercept requests. You can keep using `setupServer()` from `msw/node`, or adopt the official [`@msw/cloudflare`](https://github.com/mswjs/cloudflare) integration via `setupNetwork()`. See the updated [`request-mocking` example fixture](https://github.com/cloudflare/workers-sdk/tree/main/fixtures/vitest-pool-workers-examples/request-mocking) for the recommended pattern.
+
+### Patch Changes
+
+- [#15150](https://github.com/cloudflare/workers-sdk/pull/15150) [`2cf3143`](https://github.com/cloudflare/workers-sdk/commit/2cf314322c046a0e11ddedda0230cd44adda29a9) Thanks [@kkkhs](https://github.com/kkkhs)! - Restore typed `inject()` keys in `cloudflareTest()` pool options
+
+  `inject()` inside `cloudflareTest()` options again infers the value type from the keys you declare in your Vitest `ProvidedContext`, and reports misspelled keys. For keys that are only provided at runtime, pass an explicit type argument, e.g. `inject<number>("myPort")`.
+
+- Updated dependencies [[`186339c`](https://github.com/cloudflare/workers-sdk/commit/186339cf854cf3522614fb686ec66e6682c569b8)]:
+  - wrangler@4.123.1
+  - miniflare@5.20260811.1-alpha
+
 ## 0.21.3
 
 ### Patch Changes

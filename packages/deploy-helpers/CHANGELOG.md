@@ -1,5 +1,14 @@
 # @cloudflare/deploy-helpers
 
+## 0.7.1
+
+### Patch Changes
+
+- Updated dependencies [[`fb6b51b`](https://github.com/cloudflare/workers-sdk/commit/fb6b51b87bf73edca9866bdf2d0810d7bf491108), [`1b73c87`](https://github.com/cloudflare/workers-sdk/commit/1b73c879c168dcc78b0f2657d04bc784b8af7da3)]:
+  - @cloudflare/workers-utils@0.33.1
+  - @cloudflare/cli-shared-helpers@0.1.24
+  - miniflare@5.20260811.1-alpha
+
 ## 0.7.0
 
 ### Minor Changes
