@@ -250,7 +250,7 @@ export const devPlugin = createPlugin("dev", (ctx) => {
 						(opts) =>
 							"image_uri" in opts &&
 							new URL(`http://${opts.image_uri}`).hostname ===
-								getCloudflareContainerRegistry()
+								getCloudflareContainerRegistry(ctx.entryWorkerConfig)
 					);
 
 					if (hasCFRegistryImages) {
@@ -278,6 +278,7 @@ export const devPlugin = createPlugin("dev", (ctx) => {
 						onContainerImagePreparationStart: () => {},
 						onContainerImagePreparationEnd: () => {},
 						logger: viteDevServer.config.logger,
+						complianceConfig: ctx.entryWorkerConfig,
 					});
 
 					containerImageTags = new Set(containerTagToOptionsMap.keys());

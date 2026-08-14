@@ -73,7 +73,7 @@ export const previewPlugin = createPlugin("preview", (ctx) => {
 					(opts) =>
 						"image_uri" in opts &&
 						new URL(`http://${opts.image_uri}`).hostname ===
-							getCloudflareContainerRegistry()
+							getCloudflareContainerRegistry(ctx.allWorkerConfigs[0])
 				);
 
 				if (hasCFRegistryImages) {
@@ -103,6 +103,7 @@ export const previewPlugin = createPlugin("preview", (ctx) => {
 					onContainerImagePreparationStart: () => {},
 					onContainerImagePreparationEnd: () => {},
 					logger: vitePreviewServer.config.logger,
+					complianceConfig: ctx.allWorkerConfigs[0],
 				});
 
 				const containerImageTags = new Set(containerTagToOptionsMap.keys());

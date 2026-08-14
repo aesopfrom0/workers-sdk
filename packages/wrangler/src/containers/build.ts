@@ -12,6 +12,7 @@ import type {
 	ContainerNormalizedConfig,
 	ImageURIConfig,
 } from "@cloudflare/containers-shared";
+import type { ComplianceConfig } from "@cloudflare/workers-utils";
 
 // --- Command definitions ---
 
@@ -58,7 +59,7 @@ export const containersBuildCommand = createCommand({
 	positionalArgs: ["PATH"],
 	async handler(args, { config }) {
 		await fillOpenAPIConfiguration(config, containersScope);
-		await buildCommand(args);
+		await buildCommand(args, config);
 	},
 });
 
@@ -96,7 +97,8 @@ export async function buildContainer(
 	imageTag: string,
 	dryRun: boolean,
 	pathToDocker: string,
-	verifyDockerIsRunning?: boolean
+	verifyDockerIsRunning?: boolean,
+	complianceConfig?: ComplianceConfig
 ): Promise<ImageRef> {
 	const imageFullName = containerConfig.name + ":" + imageTag.split("-")[0];
 	logger.log("Building image", imageFullName);
@@ -111,6 +113,7 @@ export async function buildContainer(
 		pathToDocker,
 		!dryRun,
 		containerConfig,
-		verifyDockerIsRunning
+		verifyDockerIsRunning,
+		complianceConfig
 	);
 }

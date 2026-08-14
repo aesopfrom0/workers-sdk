@@ -96,7 +96,8 @@ export async function deployContainers(
 				versionId,
 				false, // dry runs will have already exited by this point
 				pathToDocker,
-				false
+				false,
+				config
 			);
 		} else {
 			imageRef = { newTag: container.image_uri };
@@ -314,6 +315,7 @@ function containerConfigToCreateRequest(
 	containerApp: ContainerNormalizedConfig,
 	imageRef: string,
 	durableObjectNamespaceId: string,
+	complianceConfig: ComplianceConfig,
 	prevApp?: Application
 ): CreateApplicationRequest {
 	return {
@@ -321,7 +323,7 @@ function containerConfigToCreateRequest(
 		scheduling_policy: containerApp.scheduling_policy,
 		configuration: {
 			// De-sugar image name
-			image: resolveImageName(accountId, imageRef),
+			image: resolveImageName(accountId, imageRef, complianceConfig),
 			// if disk/memory/vcpu is not defined in config, AND instance_type is also not defined, this will already have been defaulted to 'dev'
 			...("instance_type" in containerApp
 				? { instance_type: containerApp.instance_type }
@@ -424,6 +426,7 @@ export async function apply(
 			containerConfig,
 			imageRef,
 			args.durable_object_namespace_id,
+			config,
 			prevApp
 		),
 		containerConfig.name
@@ -453,7 +456,7 @@ export async function apply(
 		// we need to sort the objects (by key) because the diff algorithm works with lines
 		const normalisedPrevApp = sortObjectRecursive<ModifyApplicationRequestBody>(
 			stripUndefined(
-				cleanApplicationFromAPI(prevApp, containerConfig, accountId)
+				cleanApplicationFromAPI(prevApp, containerConfig, accountId, config)
 			)
 		);
 
@@ -717,13 +720,18 @@ const doAction = async (
 export function cleanApplicationFromAPI(
 	prev: Application,
 	currentConfig: ContainerNormalizedConfig,
-	accountId: string
+	accountId: string,
+	complianceConfig?: ComplianceConfig
 ): Partial<ModifyApplicationRequestBody> & Pick<Application, "configuration"> {
 	const cleanedPreviousApp: Partial<ModifyApplicationRequestBody> &
 		Pick<Application, "configuration"> = {
 		configuration: {
 			...prev.configuration,
-			image: resolveImageName(accountId, prev.configuration.image),
+			image: resolveImageName(
+				accountId,
+				prev.configuration.image,
+				complianceConfig
+			),
 		},
 		constraints: prev.constraints,
 		max_instances: prev.max_instances,

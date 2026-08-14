@@ -16,6 +16,7 @@ import type {
 	ViteLogger,
 	WranglerLogger,
 } from "./types";
+import type { ComplianceConfig } from "@cloudflare/workers-utils";
 
 export const DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE =
 	"cloudflare/proxy-everything:3cb1195@sha256:0ef6716c52430096900b150d84a3302057d6cd2319dae7987128c85d0733e3c8";
@@ -46,11 +47,13 @@ export async function pullEgressInterceptorImage(
 export async function pullImage(
 	dockerPath: string,
 	options: Exclude<ContainerDevOptions, DockerfileConfig>,
-	logger: WranglerLogger | ViteLogger
+	logger: WranglerLogger | ViteLogger,
+	complianceConfig?: ComplianceConfig
 ): Promise<{ abort: () => void; ready: Promise<void> }> {
 	const domain = new URL(`http://${options.image_uri}`).hostname;
 
-	const isExternalRegistry = domain !== getCloudflareContainerRegistry();
+	const isExternalRegistry =
+		domain !== getCloudflareContainerRegistry(complianceConfig);
 	try {
 		await dockerLoginImageRegistry(dockerPath, domain);
 	} catch (e) {
@@ -111,6 +114,7 @@ export async function prepareContainerImagesForDev(args: {
 		containerOptions: ContainerDevOptions;
 	}) => void;
 	logger: WranglerLogger | ViteLogger;
+	complianceConfig?: ComplianceConfig;
 }): Promise<void> {
 	const {
 		dockerPath,
@@ -150,7 +154,12 @@ export async function prepareContainerImagesForDev(args: {
 				containerOptions: options,
 			});
 		} else {
-			const pull = await pullImage(dockerPath, options, args.logger);
+			const pull = await pullImage(
+				dockerPath,
+				options,
+				args.logger,
+				args.complianceConfig
+			);
 			onContainerImagePreparationStart({
 				containerOptions: options,
 				abort: () => {
@@ -186,7 +195,11 @@ export async function prepareContainerImagesForDev(args: {
  * registry.cloudflare.com/accountid/image:tag -> no change
  * anyother-registry.com/anything -> no change
  */
-export function resolveImageName(accountId: string, image: string): string {
+export function resolveImageName(
+	accountId: string,
+	image: string,
+	complianceConfig?: ComplianceConfig
+): string {
 	let url: URL | undefined;
 	try {
 		url = new URL(`http://${image}`);
@@ -199,10 +212,14 @@ export function resolveImageName(accountId: string, image: string): string {
 		(!url.host.match(/[:.]/) && url.hostname !== "localhost")
 	) {
 		// Not a valid URL so assume it is in the format image:tag and prepend the registry
-		return getCloudflareRegistryWithAccountNamespace(accountId, image);
+		return getCloudflareRegistryWithAccountNamespace(
+			accountId,
+			image,
+			complianceConfig
+		);
 	}
 
-	if (url.hostname !== getCloudflareContainerRegistry()) {
+	if (url.hostname !== getCloudflareContainerRegistry(complianceConfig)) {
 		// hostname not the managed registry, passthrough
 		return image;
 	}
@@ -235,7 +252,10 @@ export function resolveImageName(accountId: string, image: string): string {
  * `acceptedRegistries` below (currently AWS ECR, DockerHub, and Google Artifact Registry).
  * When using Cloudflare managed registries we expect CLOUDFLARE_CONTAINER_REGISTRY to be set
  */
-export const getAndValidateRegistryType = (domain: string): RegistryPattern => {
+export const getAndValidateRegistryType = (
+	domain: string,
+	complianceConfig?: ComplianceConfig
+): RegistryPattern => {
 	// TODO: use parseImageName when that gets moved to this package
 	if (domain.includes("://")) {
 		throw new Error(
@@ -273,9 +293,8 @@ export const getAndValidateRegistryType = (domain: string): RegistryPattern => {
 		},
 		{
 			type: "cloudflare",
-			// Make a regex based on the env var CLOUDFLARE_CONTAINER_REGISTRY
 			pattern: new RegExp(
-				`^${getCloudflareContainerRegistry().replace(/[\\.]/g, "\\$&")}$`
+				`^${getCloudflareContainerRegistry(complianceConfig).replace(/[\\.]/g, "\\$&")}$`
 			),
 			name: "Cloudflare Containers Managed Registry",
 		},
