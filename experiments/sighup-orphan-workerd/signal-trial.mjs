@@ -66,7 +66,9 @@ function listWorkerd() {
 			.filter((l) => l.includes(projectDir) && l.includes("workerd"))
 			.map((l) => l.trim().split(/\s+/))
 			.map(([pid, ppid]) => ({ pid: Number(pid), ppid: Number(ppid) }))
-			.filter((p) => Number.isFinite(p.pid));
+			// Reject 0 explicitly: it is a valid Number() result for a blank field
+			// but means "my process group" to kill(2).
+			.filter((p) => Number.isInteger(p.pid) && p.pid > 0);
 	} catch {
 		return [];
 	}
@@ -99,6 +101,13 @@ function findRuntimeParent(launcherPid) {
 }
 
 function killPid(pid) {
+	// Guard the caller's own group. `Number("")` is 0, not NaN, so a blank or
+	// wrapped `ps` line yields pid 0 — and POSIX kill(0, sig) signals every
+	// process in the caller's group, i.e. suicide. That is what made the Linux
+	// and macOS CI jobs die with exit 137 before their first trial.
+	if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+		return;
+	}
 	try {
 		if (isWindows) {
 			execSync(`taskkill /F /PID ${pid}`, { stdio: "ignore" });
