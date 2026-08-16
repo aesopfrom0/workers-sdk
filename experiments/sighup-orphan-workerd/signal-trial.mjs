@@ -136,8 +136,12 @@ function killEverything() {
 		} else {
 			const raw = execSync("ps -Aeo pid,command", { encoding: "utf8" });
 			for (const line of raw.split("\n")) {
-				if (line.includes(projectDir) && !line.includes("signal-trial")) {
-					killPid(Number(line.trim().split(/\s+/)[0]));
+				const pid = Number(line.trim().split(/\s+/)[0]);
+				// Exclude ourselves by PID. Matching on the script name is not
+				// enough: this process's own command line contains projectDir,
+				// so a path-only match makes the runner SIGKILL itself (exit 137).
+				if (line.includes(projectDir) && pid !== process.pid) {
+					killPid(pid);
 				}
 			}
 		}
@@ -198,6 +202,25 @@ const runtimeParent = findRuntimeParent(child.pid);
 log(
 	`run ${run}: launcher=${child.pid}, runtime parent=${runtimeParent}, workerd=${before.join(", ")}`
 );
+
+// Windows does not implement SIGHUP delivery. Node's docs list only SIGINT,
+// SIGTERM and SIGKILL as terminating the target via process.kill(); SIGHUP is
+// raised by the OS when a console window closes but cannot be sent to another
+// process this way. A trial that "sends" it would leave the parent alive and
+// report ORPHANED for a reason that has nothing to do with the patch.
+//
+// Closing a real console window is the only faithful reproduction, which needs
+// an interactive session: use run-experiment.ps1 for that. Here we refuse to
+// produce a number rather than produce a misleading one.
+if (isWindows && signal === "SIGHUP") {
+	log(
+		`run ${run}: SIGHUP cannot be delivered via process.kill() on Windows — not measurable here`
+	);
+	killPid(child.pid);
+	killEverything();
+	emit([String(before.length), "NA", "NA", "UNSUPPORTED_ON_WINDOWS"]);
+	process.exit(0);
+}
 
 // Signal the PARENT only. If workerd received the signal directly it would die
 // on its own and the trial would prove nothing.
