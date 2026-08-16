@@ -1,0 +1,115 @@
+# Experiment: does the SIGHUP orphan-workerd bug (#9193) reproduce on Windows
+# and Linux, and does the exit-hook patch fix it there?
+#
+# This is not part of the repo's CI. It lives on an experiment branch in a fork
+# and is triggered by hand.
+#
+# Reading the results:
+#   baseline + SIGHUP  -> ORPHANED expected (the bug)
+#   patched  + SIGHUP  -> CLEAN    expected (the fix)
+#   any      + SIGTERM -> CLEAN    expected (control: already handled)
+#   any      + SIGINT  -> CLEAN    expected (control: already handled)
+#
+# If a platform shows CLEAN for baseline+SIGHUP, the bug does not exist there and
+# the PR should say so rather than claiming a cross-platform fix.
+name: SIGHUP orphan workerd experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Trials per combination
+        required: false
+        default: "3"
+      wrangler_version:
+        description: wrangler version to pin
+        required: false
+        default: "4.107.0"
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    name: ${{ matrix.os }} / ${{ matrix.variant }} / ${{ matrix.signal }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        variant: [baseline, patched]
+        signal: [SIGHUP, SIGTERM, SIGINT]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up the throwaway project
+        shell: bash
+        run: |
+          node experiments/sighup-orphan-workerd/setup-project.mjs \
+            "${{ matrix.variant }}" \
+            "${{ runner.temp }}/sighup-test" \
+            "${{ github.event.inputs.wrangler_version || '4.107.0' }}"
+
+      - name: Run trials
+        shell: bash
+        run: |
+          TRIALS="${{ github.event.inputs.trials || '3' }}"
+          OUT="${{ runner.temp }}/result.tsv"
+          printf 'variant\tsignal\trun\tworkerd_before\tworkerd_after\tsurvivors\tverdict\tplatform\trelease\n' > "$OUT"
+          for run in $(seq 1 "$TRIALS"); do
+            # Re-apply the variant each run so a crashed trial cannot leave the
+            # bundle in the other state.
+            node experiments/sighup-orphan-workerd/setup-project.mjs \
+              "${{ matrix.variant }}" "${{ runner.temp }}/sighup-test" >/dev/null
+            node experiments/sighup-orphan-workerd/signal-trial.mjs \
+              "${{ matrix.variant }}" "${{ matrix.signal }}" "$run" \
+              "${{ runner.temp }}/sighup-test" >> "$OUT"
+          done
+          echo "--- results ---"
+          cat "$OUT"
+
+      - name: Summarise
+        shell: bash
+        run: |
+          OUT="${{ runner.temp }}/result.tsv"
+          orphaned=$(awk -F'\t' 'NR>1 && $7=="ORPHANED"' "$OUT" | wc -l | tr -d ' ')
+          clean=$(awk -F'\t' 'NR>1 && $7=="CLEAN"' "$OUT" | wc -l | tr -d ' ')
+          failed=$(awk -F'\t' 'NR>1 && $7=="STARTUP_FAIL"' "$OUT" | wc -l | tr -d ' ')
+
+          {
+            echo "### ${{ matrix.os }} — ${{ matrix.variant }} + ${{ matrix.signal }}"
+            echo ""
+            echo "| orphaned | clean | startup failures |"
+            echo "| --- | --- | --- |"
+            echo "| $orphaned | $clean | $failed |"
+            echo ""
+            echo '```'
+            cat "$OUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed trial(s) never started workerd; these numbers are not conclusive"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.os }}-${{ matrix.variant }}-${{ matrix.signal }}
+          path: ${{ runner.temp }}/result.tsv
+          if-no-files-found: warn
+
+      - name: Upload wrangler logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}-${{ matrix.variant }}-${{ matrix.signal }}
+          path: ${{ runner.temp }}/sighup-test/dev-*.log
+          if-no-files-found: ignore

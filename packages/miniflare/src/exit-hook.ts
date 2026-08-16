@@ -43,6 +43,12 @@ function onSignalTerm(): void {
 	process.exit(128 + 15);
 }
 
+function onSignalHup(): void {
+	runCallbacks();
+	// eslint-disable-next-line unicorn/no-process-exit -- intentional: replicate default SIGHUP behavior
+	process.exit(128 + 1);
+}
+
 function onMessage(message: unknown): void {
 	if (message === "shutdown") {
 		runCallbacks();
@@ -57,6 +63,11 @@ function addListeners(): void {
 	process.on("exit", onExit);
 	process.on("SIGINT", onSignalInt);
 	process.on("SIGTERM", onSignalTerm);
+	// Without this, closing the terminal window sends `SIGHUP`, Node exits on the
+	// default disposition without running any handler, and `dispose()` never
+	// reaches the `SIGKILL` that stops `workerd`, leaving it reparented to init.
+	// See https://github.com/cloudflare/workers-sdk/issues/9193.
+	process.on("SIGHUP", onSignalHup);
 	// Only listen for IPC "shutdown" messages (PM2 support) when the process
 	// actually has an IPC channel.  Even without this guard the listener is
 	// harmless when there is no channel, but being explicit avoids any
@@ -71,6 +82,7 @@ function removeListeners(): void {
 	process.removeListener("exit", onExit);
 	process.removeListener("SIGINT", onSignalInt);
 	process.removeListener("SIGTERM", onSignalTerm);
+	process.removeListener("SIGHUP", onSignalHup);
 	process.removeListener("message", onMessage);
 }
 
