@@ -91,6 +91,21 @@ jobs:
           orphaned=$(awk -F'\t' 'NR>1 && $7=="ORPHANED"' "$OUT" | wc -l | tr -d ' ')
           clean=$(awk -F'\t' 'NR>1 && $7=="CLEAN"' "$OUT" | wc -l | tr -d ' ')
           failed=$(awk -F'\t' 'NR>1 && $7=="STARTUP_FAIL"' "$OUT" | wc -l | tr -d ' ')
+          unsupported=$(awk -F'\t' 'NR>1 && $7=="UNSUPPORTED_ON_WINDOWS"' "$OUT" | wc -l | tr -d ' ')
+
+          # Windows cannot receive SIGHUP via process.kill(). That is a limit of
+          # the harness, not a result, so the job passes while reporting nothing.
+          if [ "$unsupported" -gt 0 ]; then
+            {
+              echo "### ${{ matrix.os }} — ${{ matrix.variant }} + ${{ matrix.signal }}"
+              echo ""
+              echo "Not measurable in CI: Windows has no way to deliver SIGHUP to another"
+              echo "process. Run \`experiments/sighup-orphan-workerd/run-experiment.ps1\` on a"
+              echo "real Windows desktop, which closes an actual console window."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::SIGHUP is not deliverable on Windows via process.kill(); use run-experiment.ps1"
+            exit 0
+          fi
 
           {
             echo "### ${{ matrix.os }} — ${{ matrix.variant }} + ${{ matrix.signal }}"
