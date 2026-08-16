@@ -61,14 +61,31 @@ function listWorkerd() {
 				.map((r) => ({ pid: r.ProcessId, ppid: r.ParentProcessId }));
 		}
 		const raw = execSync("ps -Aeo pid,ppid,command", { encoding: "utf8" });
+		// Match the workerd binary by its own path, not by "does this line
+		// mention the project directory somewhere". This script's command line
+		// mentions it too, and so does the shell that launched us, so a loose
+		// match reports the runner itself as a workerd child and we end up
+		// signalling our own step shell (observed on the Linux runners, where
+		// `runtime parent` came back as the step shell three runs in a row).
+		const binary = path.join(projectDir, "node_modules");
 		return raw
 			.split("\n")
-			.filter((l) => l.includes(projectDir) && l.includes("workerd"))
-			.map((l) => l.trim().split(/\s+/))
+			.map((l) => l.trim())
+			.filter((l) => {
+				if (!l.includes(binary)) {
+					return false;
+				}
+				// The executable is the third field; require workerd to be part of
+				// the binary path rather than merely present as an argument.
+				const command = l.split(/\s+/).slice(2).join(" ");
+				const executable = command.split(/\s+/)[0] ?? "";
+				return /(^|[\\/])workerd(\.exe)?$/.test(executable);
+			})
+			.map((l) => l.split(/\s+/))
 			.map(([pid, ppid]) => ({ pid: Number(pid), ppid: Number(ppid) }))
 			// Reject 0 explicitly: it is a valid Number() result for a blank field
 			// but means "my process group" to kill(2).
-			.filter((p) => Number.isInteger(p.pid) && p.pid > 0);
+			.filter((p) => Number.isInteger(p.pid) && p.pid > 0 && p.pid !== process.pid);
 	} catch {
 		return [];
 	}
@@ -233,7 +250,16 @@ if (isWindows && signal === "SIGHUP") {
 
 // Signal the PARENT only. If workerd received the signal directly it would die
 // on its own and the trial would prove nothing.
+//
+// Never signal ourselves or an ancestor: misidentifying the parent once cost a
+// whole matrix run, where the SIGTERM jobs exited 143 because the "parent" was
+// actually the step shell that launched this script.
+const forbidden = new Set([process.pid, process.ppid, 0]);
 for (const pid of new Set([runtimeParent, child.pid])) {
+	if (forbidden.has(pid) || !Number.isInteger(pid) || pid <= 0) {
+		log(`run ${run}: refusing to signal ${pid} (self or ancestor)`);
+		continue;
+	}
 	try {
 		process.kill(pid, signal);
 	} catch (e) {
