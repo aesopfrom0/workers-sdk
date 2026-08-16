@@ -44,9 +44,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # wrangler 4.107 declares engines.node >= 22. On 20 the install "succeeds"
+      # with EBADENGINE warnings and then never starts workerd, which shows up as
+      # STARTUP_FAIL rather than an obvious error.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      - name: Report toolchain
+        shell: bash
+        run: |
+          echo "node $(node --version) | npm $(npm --version)"
+          # wrangler's engines constraint is the thing most likely to bite here.
+          node -e 'console.log("platform:", process.platform, process.arch)'
 
       - name: Set up the throwaway project
         shell: bash
@@ -94,6 +104,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # A job that never started workerd measured nothing. Letting it pass
+          # green is worse than failing: the matrix looks answered when it is not.
+          if [ "$failed" -eq "$(( orphaned + clean + failed ))" ]; then
+            echo "::error::every trial failed to start workerd — this job measured nothing"
+            exit 1
+          fi
           if [ "$failed" -gt 0 ]; then
             echo "::warning::$failed trial(s) never started workerd; these numbers are not conclusive"
           fi
