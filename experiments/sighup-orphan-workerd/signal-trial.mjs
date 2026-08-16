@@ -180,10 +180,12 @@ function emit(fields) {
 
 if (workerd.length === 0) {
 	log(`run ${run}: workerd never started — see ${logFile}`);
+	// Print the whole log, not a slice: the useful line (an engines mismatch, a
+	// missing entry point) is usually past the startup banner.
 	try {
-		log(fs.readFileSync(logFile, "utf8").split("\n").slice(0, 12).join("\n"));
-	} catch {
-		// no log to show
+		log(fs.readFileSync(logFile, "utf8").trim() || "(log is empty)");
+	} catch (e) {
+		log(`could not read ${logFile}: ${e.message}`);
 	}
 	killPid(child.pid);
 	killEverything();

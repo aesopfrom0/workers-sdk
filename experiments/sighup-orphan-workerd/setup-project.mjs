@@ -67,6 +67,26 @@ if (!fs.existsSync(backup)) {
 		stdio: "inherit",
 	});
 
+	// npm only warns on an engines mismatch, then wrangler fails to start later
+	// and the trial reports STARTUP_FAIL with no obvious cause. Fail loudly here.
+	const required = JSON.parse(
+		fs.readFileSync(
+			path.join(projectDir, "node_modules", "wrangler", "package.json"),
+			"utf8"
+		)
+	).engines?.node;
+	if (required) {
+		const min = Number(required.replace(/[^\d.]/g, "").split(".")[0]);
+		const current = Number(process.versions.node.split(".")[0]);
+		if (Number.isFinite(min) && current < min) {
+			console.error(
+				`wrangler@${wranglerVersion} requires node ${required}, but this is node ${process.versions.node}. ` +
+					`It would install and then fail to start workerd.`
+			);
+			process.exit(1);
+		}
+	}
+
 	if (!fs.existsSync(entry)) {
 		console.error(`miniflare bundle not found at ${entry}`);
 		process.exit(1);
