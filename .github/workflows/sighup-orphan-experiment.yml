@@ -129,12 +129,49 @@ jobs:
             echo "::warning::$failed trial(s) never started workerd; these numbers are not conclusive"
           fi
 
+      # The embedded case is what the PR actually argues about: `wrangler dev`
+      # leaves workerd in the caller's process group, so a group-wide SIGHUP
+      # reaches it directly and the exit hook never has to work. Only run it in
+      # the SIGHUP cells — SIGTERM/SIGINT are covered by the matrix above.
+      - name: Run embedded-Miniflare trials
+        if: matrix.signal == 'SIGHUP' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          TRIALS="${{ github.event.inputs.trials || '3' }}"
+          OUT="${{ runner.temp }}/embed.tsv"
+          printf 'case\tvariant\tsignal\trun\tworkerd_before\tworkerd_after\tsurvivors\tverdict\tplatform\trelease\n' > "$OUT"
+          for run in $(seq 1 "$TRIALS"); do
+            node experiments/sighup-orphan-workerd/setup-project.mjs \
+              "${{ matrix.variant }}" "${{ runner.temp }}/sighup-test" >/dev/null
+            node experiments/sighup-orphan-workerd/embed-trial.mjs \
+              "${{ matrix.variant }}" "$run" "${{ runner.temp }}/sighup-test" >> "$OUT"
+          done
+          echo "--- embedded results ---"
+          cat "$OUT"
+
+          orphaned=$(awk -F'\t' 'NR>1 && $8=="ORPHANED"' "$OUT" | wc -l | tr -d ' ')
+          clean=$(awk -F'\t' 'NR>1 && $8=="CLEAN"' "$OUT" | wc -l | tr -d ' ')
+          failed=$(awk -F'\t' 'NR>1 && $8=="STARTUP_FAIL"' "$OUT" | wc -l | tr -d ' ')
+          {
+            echo "### ${{ matrix.os }} — embedded Miniflare, ${{ matrix.variant }} + SIGHUP"
+            echo ""
+            echo "| orphaned | clean | startup failures |"
+            echo "| --- | --- | --- |"
+            echo "| $orphaned | $clean | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -eq "$(( orphaned + clean + failed ))" ]; then
+            echo "::error::every embedded trial failed to start — measured nothing"
+            exit 1
+          fi
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: result-${{ matrix.os }}-${{ matrix.variant }}-${{ matrix.signal }}
-          path: ${{ runner.temp }}/result.tsv
+          path: |
+            ${{ runner.temp }}/result.tsv
+            ${{ runner.temp }}/embed.tsv
           if-no-files-found: warn
 
       - name: Upload wrangler logs on failure
