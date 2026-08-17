@@ -12,7 +12,7 @@ Running `wrangler dev` from a shell puts `workerd` in the terminal's process gro
 
 It bites when Miniflare is embedded instead, which is how `vitest-pool-workers`, `@cloudflare/vite-plugin` and `remote-bindings` use it. Then the signal only reaches the host process, and `vitest-pool-workers` never calls `dispose()` itself, so this hook is the only thing that can stop `workerd`. That matches @koistya's zombie `workerd` under the VSCode Vitest extension, and the "could have been the Vitest runner code" case @petebacondarwin raised.
 
-Minimal repro — embed Miniflare, keep the process alive like a watch-mode runner, then `kill -HUP` it:
+Minimal repro — embed Miniflare, keep the process alive like a watch-mode runner, then `SIGHUP` that process:
 
 ```js
 const mf = new Miniflare({ script: "...", modules: true, port: 0 });
@@ -20,20 +20,18 @@ await mf.ready;
 setInterval(() => {}, 1000);
 ```
 
-Orphaned 3/3 before this change, clean 3/3 after.
-
 ### Measurements
 
-Signalling the parent only — if `workerd` gets the signal directly it exits on its own and the trial measures nothing. Three trials per cell on GitHub-hosted runners, wrangler 4.107.0 with miniflare 4.20260701.0:
+Signalling the host process only — if `workerd` gets the signal directly it exits on its own and the trial measures nothing. Three trials per cell on GitHub-hosted runners, miniflare 4.20260701.0:
 
-| OS | | SIGHUP | SIGTERM | SIGINT |
-| --- | --- | --- | --- | --- |
-| Linux | before | **orphaned 3/3** | clean | clean |
-| Linux | after | **clean 3/3** | clean | clean |
-| macOS | before | **orphaned 3/3** | clean | clean |
-| macOS | after | **clean 3/3** | clean | clean |
+| OS | before | after |
+| --- | --- | --- |
+| Linux | **orphaned 3/3** | **clean 3/3** |
+| macOS | **orphaned 3/3** | **clean 3/3** |
 
-An earlier 30-trial macOS run split the same way. `SIGTERM` and `SIGINT` are clean on both sides, so the working paths are unchanged. The leaked temp directory on `SIGHUP` goes away too, since `removeDirSync` sits in the same callback.
+The `SIGHUP` case also leaked the temp directory, since `removeDirSync` sits in the same callback; that goes away too.
+
+Separately, driving the same trials through `wrangler dev` — signalling only the process that owns `workerd`, so the process group doesn't shield it — gives the same split on both platforms, and `SIGTERM`/`SIGINT` stay clean before and after, so the paths that already worked are unchanged. An earlier 30-trial macOS run agreed.
 
 ### Scope
 
