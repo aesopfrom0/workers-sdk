@@ -1,129 +1,83 @@
-# SIGHUP orphan `workerd` — Windows verification
+# SIGHUP orphan `workerd` — harness
 
-Goal: find out whether the orphaned-`workerd` behaviour reproduced on macOS
-(issue [#9193](https://github.com/cloudflare/workers-sdk/issues/9193)) also happens on Windows,
-and whether the `SIGHUP` handler added to `packages/miniflare/src/exit-hook.ts` fixes it there.
+Scratch work behind the change in `packages/miniflare/src/exit-hook.ts`. Not part of the PR.
 
-**This branch is for experiments only. It is not the PR branch.**
+Start with **`이해하기.md`** for the whole story in Korean. This file is just how to run things.
 
-## What is already known
+## What's here
 
-Verified on macOS 26.5.2 (arm64), wrangler 4.107.0, miniflare 4.20260701.0, 30 trials:
-
-| miniflare | signal sent to the parent | orphaned `workerd` |
-| --- | --- | --- |
-| unpatched | `SIGHUP` | **5/5 trials** |
-| unpatched | `SIGTERM` | 0/5 |
-| unpatched | `SIGINT` | 0/5 |
-| patched | `SIGHUP` | **0/5** |
-| patched | `SIGTERM` | 0/5 |
-| patched | `SIGINT` | 0/5 |
-
-An orphan is a `workerd` whose parent died without cleaning it up, so the OS reparented it
-(PPID becomes 1 on macOS/Linux). On this machine 15 of them had accumulated, the oldest running
-for over four days.
-
-### Why it happens
-
-`packages/miniflare/src/exit-hook.ts` registers handlers for `exit`, `SIGINT`, `SIGTERM` and an
-IPC `message`, but not for `SIGHUP`. Closing a terminal window sends `SIGHUP`, Node exits on the
-default disposition without running any handler, so this chain never completes:
-
-```
-exit-hook handler  →  Miniflare dispose callback (src/index.ts:899)
-                   →  Runtime#dispose() (src/runtime/index.ts:396)
-                   →  runtimeProcess.kill("SIGKILL")   ← never reached
-```
-
-The `SIGKILL` that stops `workerd` is already there and correct. The problem is that on `SIGHUP`
-execution never gets to it.
-
-This matches what @kentonv wrote in the issue:
-
-> if SIGKILL were actually performed, there's no way workerd could be left orphaned.
-> It must be that miniflare is failing to send SIGKILL in some circumstances.
-
-The circumstance is `SIGHUP`.
-
-## Why Windows needs separate verification
-
-`exit-hook.ts` contains no platform branching, so the missing handler affects every OS. The
-Node docs also state that Windows raises `SIGHUP`:
-
-> `'SIGHUP'` is generated on Windows when the console window is closed... It can have a listener
-> installed, however Node.js will be unconditionally terminated by Windows about 10 seconds later.
-
-But two things are genuinely different on Windows and cannot be assumed:
-
-1. **There is no reparenting to PID 1.** A Windows process keeps its recorded parent PID even
-   after the parent exits, so "orphan" has to be detected differently (see below).
-2. **The 10 second kill.** Windows terminates the process about 10 seconds after the console
-   closes regardless of the handler. Cleanup has to finish inside that window. It should — the
-   dispose path is sub-millisecond — but that is a prediction, not a measurement.
-
-So the question this experiment answers is: **on Windows, does closing the console window leave
-`workerd` running, and does the patch stop that?**
-
-## How to detect an orphan on Windows
-
-Do not look for PPID 1. Instead check whether a `workerd` process is still alive while its
-recorded parent PID is gone:
-
-```powershell
-Get-CimInstance Win32_Process -Filter "Name='workerd.exe'" |
-  Select-Object ProcessId, ParentProcessId, CreationDate
-```
-
-A `workerd.exe` whose `ParentProcessId` no longer exists (or has been recycled) is the Windows
-equivalent of the macOS orphan. `run-experiment.ps1` does this check for you.
-
-## Running it
-
-Requires Node 20+, pnpm, and PowerShell 5.1 or 7+. From this directory:
-
-```powershell
-# 1. Baseline: current miniflare from npm, no patch
-.\run-experiment.ps1 -Variant baseline -Trials 3
-
-# 2. Patched: applies the SIGHUP handler to the installed miniflare bundle
-.\run-experiment.ps1 -Variant patched -Trials 3
-```
-
-The script writes `results-windows.tsv` in this directory. Please attach that file (or paste it)
-along with the summary the script prints.
-
-### What the script does
-
-For each trial:
-
-1. starts `wrangler dev` in its own console (`Start-Process`), so it owns a console that can be
-   closed
-2. waits for `workerd.exe` children to appear and records their PIDs
-3. sends the console-close event with `GenerateConsoleCtrlEvent` (`CTRL_CLOSE_EVENT`), which is
-   what Node maps to `SIGHUP` — this is the Windows analogue of closing the terminal window
-4. waits, then checks whether any recorded `workerd.exe` is still alive
-5. kills anything left over so trials do not contaminate each other
-
-It only touches processes it started itself, under a temp directory it creates.
-
-## Interpreting the result
-
-| Outcome | Meaning |
+| File | What it's for |
 | --- | --- |
-| baseline leaves `workerd` alive, patched does not | Same bug as macOS, patch fixes it on Windows |
-| both leave `workerd` alive | Patch is insufficient on Windows — likely the 10s kill, or the handler never runs |
-| neither leaves `workerd` alive | Windows already cleans up (e.g. console process group teardown); the fix is macOS/Linux only |
+| `이해하기.md` | Full write-up: what workerd/Miniflare/Wrangler are, the bug, the reversal, what's still unknown |
+| `PR-DRAFT.md` | The PR description as it will be submitted |
+| `PR-DRAFT-ko.md` | Korean version for review, plus notes on decisions made while drafting |
+| **`embed-repro.mjs`** | **The reproduction that matters.** Miniflare embedded as a library |
+| `run-experiment.sh` | macOS/Linux harness — signals the parent, counts survivors |
+| `signal-trial.mjs` | Cross-platform trial runner used by CI |
+| `setup-project.mjs` | Builds the throwaway project, applies or reverts the patch |
+| `windows-check.ps1` | Windows check. Mostly manual — see below for why |
 
-Any of the three is a useful answer. **The third one is not a failure** — it would mean the PR
-description should scope the fix to macOS/Linux instead of claiming cross-platform behaviour.
+## The short version
 
-## What this does NOT cover
+`exit-hook.ts` listens for `exit`, `SIGINT`, `SIGTERM` and an IPC `message`, but not `SIGHUP`. On
+`SIGHUP` Node exits without running any handler, so `dispose()` never runs, the `SIGKILL` that
+stops `workerd` is never reached, and the child survives.
 
-The `SIGHUP` path is one route to orphaned `workerd`, not the only one. While collecting the
-macOS data a new orphan appeared **while its parent wrangler was still alive** and no terminal
-had been closed, so at least one other route exists. `kill -9` on the parent, and crashes of
-wrangler itself, are also unfixable this way — `SIGKILL` cannot have a handler installed.
+**Closing a terminal window does not reproduce this** — I checked on iTerm2, Zed's terminal and
+`tmux kill-session`, and all three cleaned up. Running `wrangler dev` from a shell puts `workerd`
+in the terminal's process group, so the `SIGHUP` reaches it directly and it exits on its own.
 
-@danawoodman suggested killing the process **group** in the issue thread, and @petebacondarwin
-looked at `tree-kill`. That approach is more thorough than a signal handler and would cover the
-crash case too. This experiment does not evaluate it.
+The case that leaks is Miniflare **embedded** as a library, which is how `vitest-pool-workers`,
+`@cloudflare/vite-plugin` and `remote-bindings` use it. There the signal only reaches the host
+process, and `vitest-pool-workers` never calls `dispose()`, so the exit hook is the only thing
+that can stop `workerd`.
+
+## Reproducing it (the important one)
+
+```bash
+mkdir /tmp/mf && cd /tmp/mf
+npm init -y && npm pkg set type=module
+npm install miniflare@4.20260701.0
+cp <this-dir>/embed-repro.mjs .
+node embed-repro.mjs &
+# it prints "ready pid=NNNN"
+kill -HUP NNNN
+sleep 5
+ps -Aeo pid,ppid,command | grep workerd   # parent 1 => orphaned
+```
+
+Measured 6 times: orphaned 3/3 before the change, clean 3/3 after.
+
+## macOS / Linux matrix
+
+```bash
+./run-experiment.sh baseline 3
+./run-experiment.sh patched  3
+```
+
+Results append to `results-macos.tsv`. This is the same thing CI runs; the 54-trial CI output
+lives in `~/z-idea-brewery/dev-docs/wrangler-orphan-evidence/results-ci-3os.tsv`.
+
+## Windows
+
+**There is no way to script this.** Two routes were tried and both are dead ends:
+
+| Approach | Why it fails |
+| --- | --- |
+| `process.kill(pid, "SIGHUP")` | Node can only terminate a target with `SIGINT`, `SIGTERM` or `SIGKILL` on Windows |
+| `GenerateConsoleCtrlEvent` | Accepts only `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` — Node maps those to `SIGINT` and `SIGBREAK` |
+
+`SIGHUP` on Windows is Node's mapping of `CTRL_CLOSE_EVENT`, which is raised only when a console
+window is genuinely closed. So a person has to close it.
+
+```powershell
+.\windows-check.ps1 -Variant baseline   # close the window it opens, then press Enter
+.\windows-check.ps1 -Variant patched
+```
+
+Expected: `baseline` orphans, `patched` doesn't. If both come back clean, Windows doesn't have
+this bug and the PR should say so rather than claiming cross-platform behaviour — that's a useful
+answer too.
+
+Do not press Ctrl+C during the check. That's `SIGINT`, a path that already works, and it would
+measure the wrong thing.

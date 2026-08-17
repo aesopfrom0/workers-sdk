@@ -45,7 +45,7 @@ The orphans that first sent me looking at this are a different route, and I coul
 
 That matters for reading the reports in #9193: the ones involving editor integrations or long-idle servers are likely on that other route, and I'd expect them to persist after this. Covering those needs Miniflare to kill the process tree rather than a single child, which is a larger change than this one.
 
-Windows is untested. `exit-hook.ts` has no platform branching, and Node raises `SIGHUP` there when a console window closes, so I'd expect the same gap — but `process.kill()` can't deliver `SIGHUP` on Windows, so CI can't measure it, and I'd rather leave it unclaimed than report a number I can't stand behind.
+Windows is untested. `exit-hook.ts` has no platform branching and Node raises `SIGHUP` there when a console window closes, so I'd expect the same gap, but I couldn't measure it: `process.kill()` won't deliver `SIGHUP` on Windows, and `GenerateConsoleCtrlEvent` only accepts `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, which map to `SIGINT` and `SIGBREAK`. `SIGHUP` there is `CTRL_CLOSE_EVENT`, raised only when a window is genuinely closed, so it needs an interactive session rather than CI. I'd rather leave it unclaimed than report a number I can't stand behind.
 
 A process-group or `tree-kill` approach, raised by @danawoodman and @petebacondarwin in the thread, would also cover the crash case. This doesn't conflict with that: it removes one cause outright in 12 lines, without changing how processes are spawned, and a broader change would still be worth doing on top.
 
