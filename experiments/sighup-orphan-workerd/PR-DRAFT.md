@@ -1,28 +1,30 @@
-Related to #9193, though only partly: this closes one reproducible path to an orphaned `workerd` and leaves the others open. I've noted at the end which reports it won't help with.
+Related to #9193 — this closes one path to an orphaned `workerd`, not all of them.
 
-`packages/miniflare/src/exit-hook.ts` listens for `exit`, `SIGINT`, `SIGTERM` and an IPC `message`, but not `SIGHUP`. When the Miniflare process receives `SIGHUP` it therefore exits on the default disposition without running any handler: the dispose callback registered in `src/index.ts` never runs, execution never reaches `runtimeProcess.kill("SIGKILL")` in `src/runtime/index.ts`, and `workerd` survives with no parent.
+`packages/miniflare/src/exit-hook.ts` listens for `exit`, `SIGINT`, `SIGTERM` and an IPC `message`, but not `SIGHUP`. On `SIGHUP` Node exits on the default disposition without running any handler, so the dispose callback never runs, execution never reaches `runtimeProcess.kill("SIGKILL")` in `src/runtime/index.ts`, and `workerd` survives with no parent.
 
-That set of signals isn't an oversight — it's inherited. `exit-hook.ts` replaced the `exit-hook` npm package in #13515, and that package listens for exactly `exit`, `SIGINT`, `SIGTERM` and an IPC `message` too. For an ordinary CLI the omission is harmless: nothing is left behind when the process dies without running a handler. Other libraries make the opposite choice — `signal-exit`, already in this tree, does include `SIGHUP`.
+That signal set is inherited rather than chosen: it matches the `exit-hook` npm package this file replaced in #13515. Harmless for a plain CLI, but Miniflare owns a child process, so exiting without running the handler leaks one. (`signal-exit`, also in this tree, does listen for `SIGHUP`.)
 
-Miniflare is in the second category, because it owns a child process. When it exits without running its handler, `workerd` outlives it. So the default that suits a plain CLI doesn't suit this use, and `SIGHUP` is the one termination signal where that difference actually bites.
+This is the circumstance @kentonv was pointing at — "miniflare must be failing to send the SIGKILL in some circumstances". The `SIGKILL` is correct and already there; it just isn't reached.
 
-Where that shows up is when Miniflare is embedded rather than driven by `wrangler dev`, which is how `vitest-pool-workers`, `@cloudflare/vite-plugin` and `remote-bindings` all use it. Running `wrangler dev` from a shell puts `workerd` in the terminal's process group, so a `SIGHUP` on that group reaches `workerd` directly and it exits on its own — Miniflare's cleanup never has to work. Embed it and that incidental protection is gone: the signal goes to the host process, `workerd` doesn't see it, and only the exit hook can save it.
+### Where it bites
 
-`vitest-pool-workers` never calls `dispose()` itself, so on `SIGHUP` it depends entirely on this hook. A minimal embed reproduces it directly:
+Running `wrangler dev` from a shell puts `workerd` in the terminal's process group, so a `SIGHUP` reaches `workerd` directly and it exits on its own — the cleanup never has to work. **Closing a terminal window does not reproduce this**; I checked on iTerm2, Zed's terminal and `tmux kill-session`, and all three were clean.
+
+It bites when Miniflare is embedded instead, which is how `vitest-pool-workers`, `@cloudflare/vite-plugin` and `remote-bindings` use it. Then the signal only reaches the host process, and `vitest-pool-workers` never calls `dispose()` itself, so this hook is the only thing that can stop `workerd`. That matches @koistya's zombie `workerd` under the VSCode Vitest extension, and the "could have been the Vitest runner code" case @petebacondarwin raised.
+
+Minimal repro — embed Miniflare, keep the process alive like a watch-mode runner, then `kill -HUP` it:
 
 ```js
 const mf = new Miniflare({ script: "...", modules: true, port: 0 });
 await mf.ready;
-setInterval(() => {}, 1000);   // stay alive, like a watch-mode runner
+setInterval(() => {}, 1000);
 ```
 
-`kill -HUP` that process and `workerd` is reparented to init. With this change it exits cleanly. That's the same shape as @koistya's report of zombie `workerd` under the VSCode Vitest extension, and the "could have been the Vitest runner code" case @petebacondarwin mentioned.
-
-The thread already identified the shape of this: @kentonv concluded that "miniflare must be failing to send the SIGKILL in some circumstances", and @petebacondarwin described the gap as parent processes that "somehow die without cleaning up". `SIGHUP` is one such circumstance, and one such way of dying. The `SIGKILL` is correct and already there — it simply isn't reached, because no handler runs before Node exits. Adding the listener mirrors `onSignalTerm` exactly; only the exit code differs.
+Orphaned 3/3 before this change, clean 3/3 after.
 
 ### Measurements
 
-The signal goes to the parent only — if `workerd` receives it directly it terminates on its own and the trial measures nothing. Three trials per cell, wrangler 4.107.0 with miniflare 4.20260701.0, on GitHub-hosted runners:
+Signalling the parent only — if `workerd` gets the signal directly it exits on its own and the trial measures nothing. Three trials per cell on GitHub-hosted runners, wrangler 4.107.0 with miniflare 4.20260701.0:
 
 | OS | | SIGHUP | SIGTERM | SIGINT |
 | --- | --- | --- | --- | --- |
@@ -31,23 +33,15 @@ The signal goes to the parent only — if `workerd` receives it directly it term
 | macOS | before | **orphaned 3/3** | clean | clean |
 | macOS | after | **clean 3/3** | clean | clean |
 
-An earlier macOS run over 30 trials split the same way (orphaned 5/5 before, 0/5 after). `SIGTERM` and `SIGINT` stay clean on both sides, so the paths that already worked are unchanged. The `SIGHUP` case also leaked the temp directory, since `removeDirSync` sits in the same dispose callback; that goes away too.
+An earlier 30-trial macOS run split the same way. `SIGTERM` and `SIGINT` are clean on both sides, so the working paths are unchanged. The leaked temp directory on `SIGHUP` goes away too, since `removeDirSync` sits in the same callback.
 
-To reproduce by hand: start `wrangler dev`, then send `SIGHUP` to the `wrangler-dist/cli.js` process — not to the process group — and check for a `workerd` whose parent is now init.
+### Scope
 
-One thing worth stating plainly, since it's the obvious thing to try: **closing a terminal window does not reproduce this.** I checked on iTerm2, Zed's terminal and `tmux kill-session`, expecting all three to leak, and none of them did — for the process-group reason above. The embedded case is the one that leaks.
+`SIGKILL` on the parent can't be handled this way at all, so crashes and `kill -9` still leak. The orphans that first sent me looking at this turned out to be another route I couldn't pin down — each sat in its own process group whose leader had already exited, so no signal ever reached them and no handler would have run. Reports in #9193 about idle servers or editor integrations are likely on those routes and should be expected to survive this change; covering them needs Miniflare to kill the process tree, which is a larger change.
 
-### What this does not fix
+Windows is untested. `exit-hook.ts` has no platform branching and Node raises `SIGHUP` there on console close, so I'd expect the same gap — but `process.kill()` can't deliver `SIGHUP` on Windows and `GenerateConsoleCtrlEvent` only accepts `CTRL_C_EVENT`/`CTRL_BREAK_EVENT`, so it needs an interactive session rather than CI. I'd rather leave it unclaimed than report a number I can't stand behind.
 
-`SIGHUP` is one route to an orphaned `workerd`, not the only one, and probably not the most common one. `SIGKILL` on the parent can't be handled this way at all, since it can't have a handler installed.
-
-The orphans that first sent me looking at this are a different route, and I couldn't pin it down. They accumulated over several days on one machine, each sitting in its own process group whose leader had already exited, under a tool that supervises dev servers rather than a shell. Whatever killed the parents evidently never reached `workerd`, so no handler in Miniflare would have run — this change would not have prevented any of them.
-
-That matters for reading the reports in #9193: the ones involving editor integrations or long-idle servers are likely on that other route, and I'd expect them to persist after this. Covering those needs Miniflare to kill the process tree rather than a single child, which is a larger change than this one.
-
-Windows is untested. `exit-hook.ts` has no platform branching and Node raises `SIGHUP` there when a console window closes, so I'd expect the same gap, but I couldn't measure it: `process.kill()` won't deliver `SIGHUP` on Windows, and `GenerateConsoleCtrlEvent` only accepts `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, which map to `SIGINT` and `SIGBREAK`. `SIGHUP` there is `CTRL_CLOSE_EVENT`, raised only when a window is genuinely closed, so it needs an interactive session rather than CI. I'd rather leave it unclaimed than report a number I can't stand behind.
-
-A process-group or `tree-kill` approach, raised by @danawoodman and @petebacondarwin in the thread, would also cover the crash case. This doesn't conflict with that: it removes one cause outright in 12 lines, without changing how processes are spawned, and a broader change would still be worth doing on top.
+A process-group or `tree-kill` approach, raised by @danawoodman and @petebacondarwin in the thread, would cover more than this does. This doesn't conflict with it: 12 lines, no change to how processes are spawned.
 
 ---
 
